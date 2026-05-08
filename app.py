@@ -1,5 +1,5 @@
-# app.py - Aluminum Formwork Detailed Calculator
-# Assumes DXF is in MILLIMETERS (scale factor = 0.001)
+# app.py - Aluminum Formwork Detailed Calculator (Millimeter‑ready)
+# Extracts closed shapes from DXF (assumes mm), builds editable component table.
 
 import streamlit as st
 import ezdxf
@@ -113,7 +113,7 @@ mode = st.radio("Input mode", ["Manual entry (existing)", "DXF → Component Tab
 
 if mode == "Manual entry (existing)":
     st.info("Manual mode works as before. Switch to DXF mode for automated component extraction.")
-    # You can paste your old manual code here if needed
+    # You can paste your existing manual code here if needed
 
 else:
     st.subheader("📂 Upload DXF Drawing (Millimeters)")
