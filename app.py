@@ -1,5 +1,5 @@
 # app.py - Aluminum Formwork Calculator (Hybrid Mode)
-# Manual input + DXF-assisted calculation with full transparency.
+# Improved DXF processing with polygonization and manual scale override.
 
 import streamlit as st
 import ezdxf
@@ -7,6 +7,9 @@ from ezdxf import units
 import tempfile
 import os
 import math
+from shapely.geometry import LineString, Polygon, MultiLineString
+from shapely.ops import polygonize, linemerge
+import numpy as np
 
 st.set_page_config(page_title="Formwork Calculator", page_icon="📐")
 st.title("📐 Aluminum Formwork – Area & Price Calculator")
@@ -31,16 +34,13 @@ def show_quote(area_m2, price_per_sqm, drawing_name=None):
 
 # ---------- Mode selection ----------
 mode = st.radio("Select input mode", ["Manual entry", "DXF Assisted upload"])
-
 price_per_sqm = st.number_input("Your price per square meter (USD)", min_value=0.0, value=45.0, step=5.0)
 
 # ============================================
-# MODE 1: MANUAL ENTRY (following your formulas)
+# MODE 1: MANUAL ENTRY (unchanged, works well)
 # ============================================
 if mode == "Manual entry":
     st.subheader("➕ Add structural elements")
-    
-    # Initialize session state to store components
     if "components" not in st.session_state:
         st.session_state.components = []
     
@@ -95,7 +95,6 @@ if mode == "Manual entry":
         st.session_state.components.append({"desc": desc, "area": area})
         st.success(f"Added: {desc} → {area:.2f} m²")
     
-    # Display component list and total
     if st.session_state.components:
         st.subheader("📋 Component list")
         total_manual = 0.0
@@ -103,105 +102,162 @@ if mode == "Manual entry":
             st.write(f"{i+1}. {comp['desc']} – **{comp['area']:.2f} m²**")
             total_manual += comp['area']
         st.subheader(f"🏗️ Total formwork area (manual): {total_manual:.2f} m²")
-        
         if st.button("Clear all components"):
             st.session_state.components = []
             st.rerun()
-        
         show_quote(total_manual, price_per_sqm)
     else:
         st.info("Add at least one component to see the total area and quote.")
 
 # ============================================
-# MODE 2: DXF ASSISTED (transparent + manual override)
+# MODE 2: DXF ASSISTED (improved polygonization)
 # ============================================
 else:
     st.subheader("📂 Upload a DXF drawing")
     uploaded_file = st.file_uploader("Choose a DXF file", type=["dxf"])
     
     if uploaded_file is not None:
-        # Store in session state to avoid reprocessing every rerun
+        # Session state for caching
         if "dxf_area" not in st.session_state:
             st.session_state.dxf_area = None
             st.session_state.dxf_unit_desc = None
-            st.session_state.dxf_entities = None
+            st.session_state.dxf_entity_count = None
+            st.session_state.dxf_polygon_count = None
         
-        # Process the file only once
-        if st.session_state.dxf_area is None:
+        # Manual scale override input (shown before processing)
+        scale_override = st.number_input(
+            "Manual scale factor (leave 0 to auto-detect):\n1 unit = ? meters (e.g., 0.001 for mm, 0.0254 for inches)",
+            min_value=0.0, value=0.0, step=0.0001, format="%f"
+        )
+        
+        # Process only once
+        if st.session_state.dxf_area is None and uploaded_file is not None:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
                 tmp.write(uploaded_file.getvalue())
                 tmp_path = tmp.name
+            
             try:
                 doc = ezdxf.readfile(tmp_path)
                 msp = doc.modelspace()
                 
-                # Entity count
-                lines = len(list(msp.query("LINE")))
-                polylines = len(list(msp.query("LWPOLYLINE POLYLINE")))
-                blocks = len(list(msp.query("INSERT")))
-                total_entities = lines + polylines + blocks
-                st.session_state.dxf_entities = total_entities
+                # --- 1. Collect all line segments from relevant entities ---
+                segments = []
                 
-                # Unit detection
-                doc_units = doc.units
-                if doc_units == units.M:
-                    sf = 1.0
-                    unit_desc = "meters"
-                elif doc_units == units.CM:
-                    sf = 0.01
-                    unit_desc = "centimeters"
-                elif doc_units == units.MM:
-                    sf = 0.001
-                    unit_desc = "millimeters"
-                elif doc_units == units.INCH:
-                    sf = 0.0254
-                    unit_desc = "inches"
-                else:
-                    sf = 1.0
-                    unit_desc = "unknown (assuming meters)"
+                # Helper to add a segment between two points
+                def add_seg(p1, p2):
+                    segments.append(LineString([(p1.x, p1.y), (p2.x, p2.y)]))
                 
-                # Try to compute area from closed polylines
-                total_area_units = 0.0
+                # LINEs
+                for line in msp.query("LINE"):
+                    add_seg(line.dxf.start, line.dxf.end)
+                
+                # LWPOLYLINE and POLYLINE (explode into segments)
                 for poly in msp.query("LWPOLYLINE POLYLINE"):
-                    if poly.closed:
-                        points = []
-                        if poly.dxftype() == "LWPOLYLINE":
-                            points = [(x, y) for x, y in poly.vertices()]
+                    points = []
+                    if poly.dxftype() == "LWPOLYLINE":
+                        points = [(x, y) for x, y in poly.vertices()]
+                    else:
+                        points = [(v.dxf.location.x, v.dxf.location.y) for v in poly.vertices]
+                    if len(points) >= 2:
+                        for i in range(len(points)-1):
+                            segments.append(LineString([points[i], points[i+1]]))
+                        if poly.closed and len(points) >= 3:
+                            segments.append(LineString([points[-1], points[0]]))
+                
+                # ARCs (approximate by chord or small segments)
+                for arc in msp.query("ARC"):
+                    # Convert arc to a set of line segments (simplify)
+                    center = arc.dxf.center
+                    radius = arc.dxf.radius
+                    start_angle = arc.dxf.start_angle
+                    end_angle = arc.dxf.end_angle
+                    # Use 20 segments for smoothness
+                    num_seg = max(4, int(abs(end_angle - start_angle) / 10))
+                    angles = np.linspace(start_angle, end_angle, num_seg+1)
+                    pts = [(center.x + radius*math.cos(np.radians(a)), center.y + radius*math.sin(np.radians(a))) for a in angles]
+                    for i in range(len(pts)-1):
+                        segments.append(LineString([pts[i], pts[i+1]]))
+                
+                # CIRCLEs (approximate by polygon)
+                for circle in msp.query("CIRCLE"):
+                    center = circle.dxf.center
+                    radius = circle.dxf.radius
+                    num_seg = 36
+                    angles = np.linspace(0, 360, num_seg+1)
+                    pts = [(center.x + radius*math.cos(np.radians(a)), center.y + radius*math.sin(np.radians(a))) for a in angles]
+                    for i in range(len(pts)-1):
+                        segments.append(LineString([pts[i], pts[i+1]]))
+                
+                # --- 2. Merge collinear segments and polygonize ---
+                if len(segments) == 0:
+                    st.warning("No geometry found in the DXF file.")
+                    st.session_state.dxf_area = 0.0
+                else:
+                    # Merge overlapping/collinear lines
+                    merged = linemerge(MultiLineString(segments))
+                    # Polygonize the merged linework
+                    polygons = list(polygonize(merged))
+                    st.session_state.dxf_polygon_count = len(polygons)
+                    
+                    # --- 3. Determine scale factor ---
+                    if scale_override > 0:
+                        sf = scale_override
+                        unit_desc = f"manual override (1 unit = {scale_override} m)"
+                    else:
+                        doc_units = doc.units
+                        if doc_units == units.M:
+                            sf = 1.0
+                            unit_desc = "meters"
+                        elif doc_units == units.CM:
+                            sf = 0.01
+                            unit_desc = "centimeters"
+                        elif doc_units == units.MM:
+                            sf = 0.001
+                            unit_desc = "millimeters"
+                        elif doc_units == units.INCH:
+                            sf = 0.0254
+                            unit_desc = "inches"
                         else:
-                            points = [(v.dxf.location.x, v.dxf.location.y) for v in poly.vertices]
-                        if len(points) >= 3:
-                            # Use shapely for area
-                            try:
-                                from shapely.geometry import Polygon
-                                poly_shapely = Polygon(points)
-                                total_area_units += poly_shapely.area
-                            except:
-                                pass
-                st.session_state.dxf_area = total_area_units * (sf ** 2)
-                st.session_state.dxf_unit_desc = unit_desc
+                            # Default: assume meters, but warn
+                            sf = 1.0
+                            unit_desc = "unknown (assuming meters). Use manual scale if wrong."
+                            st.warning("No unit information in DXF. Assuming 1 drawing unit = 1 meter. You can override below.")
+                    
+                    # --- 4. Calculate total area in square meters ---
+                    total_area = 0.0
+                    for poly in polygons:
+                        if poly.is_valid and not poly.is_empty:
+                            total_area += poly.area * (sf ** 2)
+                    
+                    st.session_state.dxf_area = total_area
+                    st.session_state.dxf_unit_desc = unit_desc
+                    st.session_state.dxf_entity_count = len(segments)
+            
             except Exception as e:
-                st.error(f"Error reading DXF: {e}")
+                st.error(f"Error processing DXF: {e}")
                 st.session_state.dxf_area = -1
             finally:
                 os.unlink(tmp_path)
         
         # Display results
         if st.session_state.dxf_area == -1:
-            st.error("Could not parse the DXF file. Please try another file or switch to Manual mode.")
+            st.error("Failed to process DXF. Please try another file or switch to Manual mode.")
         else:
             st.write(f"**File name:** {uploaded_file.name}")
-            st.write(f"**Entities found:** {st.session_state.dxf_entities} (lines, polylines, blocks)")
-            st.write(f"**Detected units:** {st.session_state.dxf_unit_desc}")
-            st.info("⚠️ Automatic area calculation from DXF is often inaccurate due to scaling and geometry issues. Please verify below.")
+            if st.session_state.dxf_entity_count is not None:
+                st.write(f"**Line segments extracted:** {st.session_state.dxf_entity_count}")
+            if st.session_state.dxf_polygon_count is not None:
+                st.write(f"**Closed polygons formed:** {st.session_state.dxf_polygon_count}")
+            st.write(f"**Unit scale:** {st.session_state.dxf_unit_desc}")
             
             auto_area = st.session_state.dxf_area if st.session_state.dxf_area else 0.0
             st.metric("Automatically calculated area (m²)", f"{auto_area:.2f}")
             
-            # Manual override
-            st.subheader("✏️ Manual override")
-            corrected_area = st.number_input("Enter correct area (m²) if auto is wrong", min_value=0.0, value=max(auto_area, 0.0), step=10.0)
+            # Manual override input for area (final adjustment)
+            st.subheader("✏️ Manual override (final area)")
+            corrected_area = st.number_input("Enter correct area (m²) if auto is wrong", min_value=0.0, value=float(auto_area), step=10.0)
             
             if corrected_area > 0:
                 show_quote(corrected_area, price_per_sqm, uploaded_file.name)
             else:
-                st.warning("Enter a positive area or use Manual mode.")
+                st.warning("Enter a positive area to generate a quote.")
