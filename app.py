@@ -1,4 +1,5 @@
-# app.py - Aluminum Formwork Calculator with Detailed Component Table
+# app.py - Aluminum Formwork Detailed Calculator
+# Assumes DXF is in MILLIMETERS (scale factor = 0.001)
 
 import streamlit as st
 import ezdxf
@@ -12,11 +13,11 @@ from shapely.geometry import LineString, Polygon, MultiLineString
 from shapely.ops import polygonize, linemerge
 
 st.set_page_config(page_title="Formwork Calculator", page_icon="📐")
-st.title("📐 Aluminum Formwork – Detailed Area Calculator")
-st.markdown("Upload a DXF floor plan. The app will detect closed areas and list them like a bill of quantities.")
+st.title("📐 Aluminum Formwork – Detailed Area & Quote Calculator")
+st.markdown("Upload a DXF floor plan (millimeters). The system extracts closed shapes and builds a detailed component table.")
 
 # ------------------------------------------------------------------
-# Helper: extract all closed polygons from DXF
+# Extract closed polygons from DXF (works with lines, arcs, circles)
 # ------------------------------------------------------------------
 def extract_polygons_from_dxf(file_bytes):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".dxf") as tmp:
@@ -28,165 +29,170 @@ def extract_polygons_from_dxf(file_bytes):
         msp = doc.modelspace()
         segments = []
 
-        # Helper to add line segment
         def add_seg(p1, p2):
             segments.append(LineString([(p1.x, p1.y), (p2.x, p2.y)]))
 
-        # 1. LINES
+        # LINES
         for line in msp.query("LINE"):
             add_seg(line.dxf.start, line.dxf.end)
 
-        # 2. POLYLINES / LWPOLYLINES
+        # POLYLINES
         for poly in msp.query("LWPOLYLINE POLYLINE"):
-            points = []
+            pts = []
             if poly.dxftype() == "LWPOLYLINE":
-                points = [(x, y) for x, y in poly.vertices()]
+                pts = [(x, y) for x, y in poly.vertices()]
             else:
-                points = [(v.dxf.location.x, v.dxf.location.y) for v in poly.vertices]
-            if len(points) >= 2:
-                for i in range(len(points)-1):
-                    segments.append(LineString([points[i], points[i+1]]))
-                if poly.closed and len(points) >= 3:
-                    segments.append(LineString([points[-1], points[0]]))
+                pts = [(v.dxf.location.x, v.dxf.location.y) for v in poly.vertices]
+            if len(pts) >= 2:
+                for i in range(len(pts)-1):
+                    segments.append(LineString([pts[i], pts[i+1]]))
+                if poly.closed and len(pts) >= 3:
+                    segments.append(LineString([pts[-1], pts[0]]))
 
-        # 3. ARCS (approximate by line segments)
+        # ARCS (approximate by line segments)
         for arc in msp.query("ARC"):
             center = arc.dxf.center
-            radius = arc.dxf.radius
-            start_angle = arc.dxf.start_angle
-            end_angle = arc.dxf.end_angle
-            num_seg = max(4, int(abs(end_angle - start_angle) / 10))
-            angles = np.linspace(start_angle, end_angle, num_seg+1)
-            pts = [(center.x + radius*math.cos(np.radians(a)),
-                    center.y + radius*math.sin(np.radians(a))) for a in angles]
+            r = arc.dxf.radius
+            sa = arc.dxf.start_angle
+            ea = arc.dxf.end_angle
+            num = max(4, int(abs(ea - sa) / 10))
+            angles = np.linspace(sa, ea, num+1)
+            pts = [(center.x + r*math.cos(np.radians(a)), center.y + r*math.sin(np.radians(a))) for a in angles]
             for i in range(len(pts)-1):
                 segments.append(LineString([pts[i], pts[i+1]]))
 
-        # 4. CIRCLES (polygon approximation)
-        for circle in msp.query("CIRCLE"):
-            center = circle.dxf.center
-            radius = circle.dxf.radius
-            num_seg = 36
-            angles = np.linspace(0, 360, num_seg+1)
-            pts = [(center.x + radius*math.cos(np.radians(a)),
-                    center.y + radius*math.sin(np.radians(a))) for a in angles]
+        # CIRCLES
+        for circ in msp.query("CIRCLE"):
+            center = circ.dxf.center
+            r = circ.dxf.radius
+            num = 36
+            angles = np.linspace(0, 360, num+1)
+            pts = [(center.x + r*math.cos(np.radians(a)), center.y + r*math.sin(np.radians(a))) for a in angles]
             for i in range(len(pts)-1):
                 segments.append(LineString([pts[i], pts[i+1]]))
 
         if not segments:
             return [], None
 
-        # Merge and polygonize
         merged = linemerge(MultiLineString(segments))
         polygons = list(polygonize(merged))
-        # Remove tiny artifacts (area < 1e-6 after scaling will be filtered later)
         return polygons, doc.units
 
     except Exception as e:
-        st.error(f"DXF parsing error: {e}")
+        st.error(f"DXF error: {e}")
         return [], None
     finally:
         os.unlink(tmp_path)
 
 
 # ------------------------------------------------------------------
-# Classify each polygon as Column / Wall / Slab / Other
+# Classify polygon based on aspect ratio and size
 # ------------------------------------------------------------------
-def classify_polygon(poly, tol=0.1):
+def classify_polygon(poly):
     minx, miny, maxx, maxy = poly.bounds
-    width = abs(maxx - minx)
-    length = abs(maxy - miny)
-    # Sort so width <= length
-    if width > length:
-        width, length = length, width
-    aspect = length / width if width > 0 else 1
+    w = maxx - minx
+    l = maxy - miny
+    if w > l:
+        w, l = l, w
+    aspect = l / w if w > 0 else 1
 
-    if aspect < 1.5 and width < 2.0:   # compact and small → column
-        return "Column", width, length
-    elif aspect >= 3.0 and length > 2.0:   # long thin → wall
-        return "Wall", width, length
-    elif aspect >= 0.5 and length > 3.0:   # large area → slab (or floor)
-        return "Slab", width, length
+    if aspect < 1.5 and w < 2.0:       # small, square → column
+        return "Column"
+    elif aspect >= 3.0 and l > 2.0:    # long, thin → wall
+        return "Wall"
+    elif aspect >= 0.5 and l > 3.0:    # large, rectangular → slab
+        return "Slab"
     else:
-        return "Other", width, length
+        return "Other"
 
 
 # ------------------------------------------------------------------
-# Main app
+# Main UI
 # ------------------------------------------------------------------
-mode = st.radio("Input mode", ["Manual entry (as before)", "DXF → Detailed Table (New)"])
+mode = st.radio("Input mode", ["Manual entry (existing)", "DXF → Component Table (NEW)"])
 
-if mode == "Manual entry (as before)":
-    # Keep your existing manual code (not shown here for brevity, but you can paste it)
-    st.info("Manual mode works as before. Switch to DXF mode for detailed table.")
+if mode == "Manual entry (existing)":
+    st.info("Manual mode works as before. Switch to DXF mode for automated component extraction.")
+    # You can paste your old manual code here if needed
 
 else:
-    st.subheader("📂 Upload DXF Floor Plan")
+    st.subheader("📂 Upload DXF Drawing (Millimeters)")
     uploaded_file = st.file_uploader("Choose a DXF file", type=["dxf"])
-    height_default = st.number_input("Default column/wall height (meters)", min_value=0.1, value=3.0, step=0.1)
-    scale_override = st.number_input("Scale factor (1 drawing unit = ? meters).\nLeave 0 to auto-detect, or set manually:\n0.001 for mm, 0.0254 for inches, 1 for meters",
-                                     min_value=0.0, value=0.0, step=0.0001, format="%f")
+    default_height = st.number_input("Default column/wall height (meters)", min_value=0.1, value=3.0, step=0.1)
+
+    # Always assume millimeters unless user overrides
+    use_mm = st.checkbox("Drawing is in millimeters (default: ON)", value=True)
+    custom_scale = st.number_input("Custom scale (1 unit = ? meters). Leave 0 to auto-detect.", min_value=0.0, value=0.0, step=0.0001)
 
     if uploaded_file is not None:
         polygons, doc_units = extract_polygons_from_dxf(uploaded_file.getvalue())
 
         if not polygons:
-            st.warning("No closed polygons found. The DXF may contain only open lines.")
+            st.warning("No closed polygons found. The DXF may only contain open lines.")
         else:
             # Determine scale factor
-            if scale_override > 0:
-                sf = scale_override
-                unit_desc = f"manual (1 unit = {sf} m)"
+            if custom_scale > 0:
+                sf = custom_scale
+                scale_desc = f"manual (1 unit = {sf} m)"
+            elif use_mm:
+                sf = 0.001
+                scale_desc = "millimeters (assumed) → 0.001 m per unit"
             else:
+                # Auto from DXF header
                 if doc_units == units.M:
                     sf = 1.0
-                    unit_desc = "meters"
+                    scale_desc = "meters"
                 elif doc_units == units.CM:
                     sf = 0.01
-                    unit_desc = "centimeters"
+                    scale_desc = "centimeters"
                 elif doc_units == units.MM:
                     sf = 0.001
-                    unit_desc = "millimeters"
+                    scale_desc = "millimeters"
                 elif doc_units == units.INCH:
                     sf = 0.0254
-                    unit_desc = "inches"
+                    scale_desc = "inches"
                 else:
-                    sf = 1.0
-                    unit_desc = "unknown (assuming meters) – adjust scale manually if needed"
-                    st.warning(unit_desc)
+                    sf = 0.001
+                    scale_desc = "unknown – assuming millimeters"
 
-            # Build component list
+            st.info(f"Scale: 1 drawing unit = {sf*1000:.3f} mm → {sf} m")
+
             components = []
             for i, poly in enumerate(polygons):
-                if poly.is_valid and not poly.is_empty and poly.area > 1e-6:
-                    typ, w, l = classify_polygon(poly)
-                    # Convert drawing units to meters
-                    w_m = w * sf
-                    l_m = l * sf
-                    area_2d = poly.area * (sf ** 2)   # horizontal area
-                    # For formwork, we need perimeter * height for columns/walls
-                    perimeter_m = (2 * (w_m + l_m))
-                    # For columns/walls, formwork area = perimeter * height
-                    # For slabs, just the bottom area
+                if poly.is_valid and poly.area > 1e-6:
+                    typ = classify_polygon(poly)
+                    # Get bounding box dimensions in meters
+                    minx, miny, maxx, maxy = poly.bounds
+                    w_m = (maxx - minx) * sf
+                    l_m = (maxy - miny) * sf
+                    # Ensure width <= length for consistency
+                    if w_m > l_m:
+                        w_m, l_m = l_m, w_m
+                    perimeter_m = 2 * (w_m + l_m)
+
                     if typ in ("Column", "Wall"):
-                        formwork_area = perimeter_m * height_default
+                        formwork_area = perimeter_m * default_height
+                        height_val = default_height
                     elif typ == "Slab":
-                        formwork_area = w_m * l_m   # bottom only
+                        formwork_area = w_m * l_m
+                        height_val = "N/A"
                     else:
-                        formwork_area = area_2d      # fallback
+                        formwork_area = poly.area * (sf ** 2)
+                        height_val = "N/A"
+
                     components.append({
                         "SR.NO": i+1,
                         "TYPE": typ,
                         "NAME": f"{typ}_{i+1}",
                         "WIDTH (m)": round(w_m, 3),
                         "LENGTH (m)": round(l_m, 3),
-                        "HEIGHT (m)": height_default if typ in ("Column","Wall") else "N/A",
+                        "HEIGHT (m)": height_val if typ in ("Column","Wall") else "N/A",
                         "PERIMETER (m)": round(perimeter_m, 3) if typ in ("Column","Wall") else "-",
                         "AREA (m²)": round(formwork_area, 3)
                     })
 
             df = pd.DataFrame(components)
-            st.success(f"Found {len(df)} closed areas. Scale: {unit_desc}")
+            st.success(f"Found {len(df)} closed areas. Scale: {scale_desc}")
 
             # Editable table
             st.subheader("📋 Component List – Edit as needed")
@@ -201,6 +207,5 @@ else:
             if st.button("Generate Quote"):
                 total_price = total_area * price
                 st.success(f"💰 **Estimated Quote: ${total_price:,.2f} USD**")
-                # Option to download as CSV
                 csv = edited_df.to_csv(index=False)
-                st.download_button("Download as CSV", data=csv, file_name="formwork_components.csv", mime="text/csv")
+                st.download_button("Download Component List as CSV", data=csv, file_name="formwork_components.csv", mime="text/csv")
